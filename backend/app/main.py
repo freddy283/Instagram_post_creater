@@ -13,6 +13,11 @@ from app.database import init_db
 from app.routers import auth, user, instagram, schedule, posts
 from app.routers import video
 
+from dotenv import load_dotenv
+
+# Load environment variables from the .env file (looks for a .env file in the current or parent directories by default)
+load_dotenv()
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 

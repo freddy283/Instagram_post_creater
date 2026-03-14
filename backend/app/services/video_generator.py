@@ -163,59 +163,75 @@ def _split_sentences(script_text):
 # TTS — edge-tts (free, Microsoft Neural voices, no API key)
 # =============================================================================
 
+# ── Batch TTS: generate all sentences in a SINGLE async session ──────────────
+# Running each sentence in a separate asyncio.run() causes the 3rd call to fail
+# because Windows event loop state gets polluted. One session handles all.
+
 def _generate_tts(text, out_path):
-    return _tts_edge(text, out_path) or _tts_pyttsx3(text, out_path)
+    """Single-sentence wrapper — uses batch under the hood."""
+    results = _tts_edge_batch([text], [out_path])
+    return results[0]
 
 
-# Persistent event loop for edge-tts — reusing avoids asyncio.run() conflicts
-# when called multiple times in the same thread (sentence 3 failure fix)
-_tts_loop = None
-_tts_lock  = threading.Lock()
-
-
-def _get_tts_loop():
-    global _tts_loop
-    import asyncio
-    with _tts_lock:
-        if _tts_loop is None or _tts_loop.is_closed():
-            _tts_loop = asyncio.new_event_loop()
-        return _tts_loop
-
-
-def _tts_edge(text, out_path):
-    """Microsoft Edge Neural TTS — free, no API key, needs internet.
-    Uses a persistent event loop to avoid asyncio conflicts on repeated calls."""
+def _tts_edge_batch(texts, out_paths):
+    """
+    Generate TTS for ALL sentences in one single async event loop.
+    Returns list of bools (success per sentence).
+    """
     try:
-        import edge_tts, asyncio
+        import edge_tts
 
-        async def _do():
-            comm = edge_tts.Communicate(text, "en-US-GuyNeural", rate="-8%")
-            await comm.save(out_path)
+        async def _do_all():
+            results = []
+            for text, path in zip(texts, out_paths):
+                # Skip empty text — don't send to TTS
+                if not text or not text.strip():
+                    logger.warning(f"TTS: skipping empty sentence")
+                    results.append(False)
+                    continue
+                try:
+                    comm = edge_tts.Communicate(text, "en-US-GuyNeural", rate="-8%")
+                    await comm.save(path)
+                    ok = os.path.isfile(path) and os.path.getsize(path) > 1000
+                    results.append(ok)
+                    if ok:
+                        logger.info(f"TTS: edge-tts ✓ ({text[:40]}…)")
+                    else:
+                        logger.warning(f"TTS: empty output for ({text[:40]}…)")
+                        results.append(False)
+                except Exception as e:
+                    logger.warning(f"TTS sentence failed: {e}")
+                    results.append(False)
+            return results
 
         exc = []
+        ret = []
 
         def _thread():
+            import asyncio
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                loop.run_until_complete(_do())
+                nonlocal ret
+                ret = loop.run_until_complete(_do_all())
             except Exception as e:
                 exc.append(e)
             finally:
                 loop.close()
+                asyncio.set_event_loop(None)
 
         t = threading.Thread(target=_thread, daemon=True)
         t.start()
-        t.join(timeout=45)
+        t.join(timeout=120)
         if exc:
             raise exc[0]
-        ok = os.path.isfile(out_path) and os.path.getsize(out_path) > 1000
-        if ok:
-            logger.info("TTS: edge-tts ✓")
-        return ok
+        return ret if ret else [False] * len(texts)
     except Exception as e:
-        logger.warning(f"edge-tts: {e}")
-        return False
+        logger.warning(f"edge-tts batch: {e}")
+        return [False] * len(texts)
+
+
+
 
 
 def _tts_pyttsx3(text, out_path):
@@ -376,7 +392,9 @@ def _render_frame(
 
     # ── Content text ───────────────────────────────────────────────────────────
     if is_last and quote:
-        _draw_quote(draw, quote, author)
+        # Last scene: sentence in upper zone, quote in lower zone — no overlap
+        _draw_sentence_upper(draw, sentence)
+        _draw_quote_small(draw, quote, author)
     else:
         _draw_sentence(draw, sentence)
 
@@ -442,21 +460,47 @@ def _draw_sentence(draw, sentence):
         draw.text((tx,     ty),     line, font=tf, fill=(255, 255, 255, 248))
 
 
-def _draw_quote(draw, quote, author):
-    """Draw closing quote in gold — vertically centred in lower half."""
-    qtext = f'"{quote}"'
-    qf    = _font(54, bold=True)
+def _draw_sentence_upper(draw, sentence):
+    """Draw sentence in upper-centre zone (40-62%) — leaves room for quote below."""
+    tf = _font(56, bold=True)
     while True:
-        lines = _wrap(qtext, qf, W - 120)
-        if len(lines) <= 5 or qf.size <= 34:
+        lines = _wrap(sentence or " ", tf, W - 110)
+        if len(lines) <= 3 or tf.size <= 34:
             break
-        qf = _font(qf.size - 3, bold=True)
+        tf = _font(tf.size - 4, bold=True)
 
-    lh      = qf.size + 22
-    total_h = len(lines) * lh + (80 if author else 0)
+    lh      = tf.size + 24
+    total_h = len(lines) * lh
+    zone_top    = int(H * 0.38)
+    zone_bottom = int(H * 0.60)
+    zone_h      = zone_bottom - zone_top
+    start_y     = zone_top + (zone_h - total_h) // 2
 
-    # Centre the quote block between 52% and 88% of screen height
-    zone_top    = int(H * 0.52)
+    for i, line in enumerate(lines):
+        bb  = draw.textbbox((0, 0), line, font=tf)
+        tx  = (W - (bb[2] - bb[0])) // 2
+        ty  = start_y + i * lh
+        draw.text((tx + 3, ty + 3), line, font=tf, fill=(0, 0, 0, 210))
+        draw.text((tx,     ty),     line, font=tf, fill=(255, 255, 255, 248))
+
+
+def _draw_quote_small(draw, quote, author):
+    """Draw compact quote in lower zone (65-88%) — always below sentence text."""
+    if not quote:
+        return
+
+    # Gold separator line
+    mx = 120
+    draw.line([(mx, int(H * 0.63)), (W - mx, int(H * 0.63))],
+              fill=(*GOLD_DIM, 80), width=1)
+
+    qf    = _font(36, bold=False)
+    qtext = f'"{quote}"'
+    lines = _wrap(qtext, qf, W - 140)
+
+    lh          = qf.size + 16
+    total_h     = len(lines) * lh + (42 if author else 0)
+    zone_top    = int(H * 0.65)
     zone_bottom = int(H * 0.88)
     zone_h      = zone_bottom - zone_top
     start_y     = zone_top + (zone_h - total_h) // 2
@@ -465,16 +509,16 @@ def _draw_quote(draw, quote, author):
         bb  = draw.textbbox((0, 0), line, font=qf)
         tx  = (W - (bb[2] - bb[0])) // 2
         ty  = start_y + i * lh
-        draw.text((tx + 2, ty + 2), line, font=qf, fill=(0, 0, 0, 200))
-        draw.text((tx,     ty),     line, font=qf, fill=(*GOLD, 242))
+        draw.text((tx + 1, ty + 1), line, font=qf, fill=(0, 0, 0, 170))
+        draw.text((tx,     ty),     line, font=qf, fill=(*GOLD, 210))
 
     if author:
-        af  = _font(40, bold=False)
+        af  = _font(30, bold=False)
         atx = f"— {author}"
         bb  = draw.textbbox((0, 0), atx, font=af)
         tx  = (W - (bb[2] - bb[0])) // 2
-        ty  = start_y + len(lines) * lh + 30
-        draw.text((tx, ty), atx, font=af, fill=(*GOLD_DIM, 200))
+        ty  = start_y + len(lines) * lh + 10
+        draw.text((tx, ty), atx, font=af, fill=(*GOLD_DIM, 185))
 
 
 # =============================================================================
@@ -632,14 +676,14 @@ def generate_animated_video(
         sentence_audios = []   # list of (audio_path_or_None, duration_s)
         fallback_dur    = TARGET_DURATION_S / SCENES_COUNT  # e.g. 6s
 
-        for i, sentence in enumerate(sentences):
-            audio_path = tempfile.mktemp(suffix=f"_sent{i}.mp3")
-            ok = _generate_tts(sentence, audio_path)
+        # Generate ALL sentences in one batch TTS call (fixes sentence-3 failure)
+        audio_paths = [tempfile.mktemp(suffix=f"_sent{i}.mp3") for i in range(len(sentences))]
+        tts_results = _tts_edge_batch(sentences, audio_paths)
+
+        for i, (sentence, audio_path, ok) in enumerate(zip(sentences, audio_paths, tts_results)):
             if ok:
                 tmp_files.append(audio_path)
                 dur = _audio_duration(audio_path)
-                # Add small padding so text stays visible after voice ends
-                # Cap: min 3s (very short sentence), max 9s (one sentence shouldn't be longer)
                 dur = max(3.0, min(9.0, dur + 0.5))
                 sentence_audios.append((audio_path, dur))
                 logger.info(f"  Sentence {i+1}: {dur:.2f}s — {sentence[:50]}")

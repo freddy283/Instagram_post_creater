@@ -17,7 +17,7 @@ WHY ModelScope 1.7B instead of CogVideoX-5B:
 Each provider is independently optional — app works with zero keys.
 """
 
-import os, time, json, logging, tempfile, subprocess, shutil, requests
+import os, time, json, logging, tempfile, subprocess, shutil, requests, base64
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -96,57 +96,108 @@ def _download(url: str, dest: str, timeout: int = 120) -> bool:
 # Get key:  Dashboard → API → copy "Basic xxxx..." token
 # .env:     DID_API_KEY=Basic dXNlckBleGF...
 # =============================================================================
+
+def _fix_did_key(raw: str) -> str:
+    """Auto-fix D-ID key: if user pasted email:password without base64-encoding, fix it."""
+    raw = raw.strip()
+    if not raw.startswith("Basic "):
+        # No prefix at all — encode the whole thing
+        return "Basic " + base64.b64encode(raw.encode()).decode()
+    token = raw[6:].strip()
+    # Check if token contains a raw colon (un-encoded email:password)
+    try:
+        decoded = base64.b64decode(token + "==").decode("utf-8", errors="ignore")
+    except Exception:
+        decoded = ""
+    if ":" in token and ":" not in decoded:
+        # Raw colon present but not in decoded — it's un-encoded
+        return "Basic " + base64.b64encode(token.encode()).decode()
+    return raw
+
+
 def generate_with_did(script: str, output_path: str) -> Optional[str]:
-    api_key = _get_key("DID_API_KEY")
-    if not api_key:
+    raw_key = _get_key("DID_API_KEY")
+    if not raw_key:
+        logger.info("DID_API_KEY not set — get free key at studio.d-id.com")
         return None
 
-    headers = {
-        "Authorization": api_key,
-        "Content-Type":  "application/json",
-        "Accept":        "application/json",
-    }
+    api_key = _fix_did_key(raw_key)
+    logger.info(f"D-ID: using key {api_key[:18]}...")
+    headers = {"Authorization": api_key, "Content-Type": "application/json", "Accept": "application/json"}
     BASE = "https://api.d-id.com"
 
-    try:
-        payload = {
-            "source_url": "https://create-images-results.d-id.com/DefaultPresenters/Noelle_f/image.jpeg",
-            "script": {
-                "type":     "text",
-                "input":    script,
-                "provider": {
-                    "type":         "microsoft",
-                    "voice_id":     "en-US-GuyNeural",
-                    "voice_config": {"style": "Newscast"},
-                },
-            },
-            "config": {"fluent": True, "pad_audio": 0.0, "stitch": True},
-        }
+    script_block = {
+        "type": "text",
+        "input": script,
+        "provider": {"type": "microsoft", "voice_id": "en-US-GuyNeural"},
+    }
 
-        r = requests.post(f"{BASE}/talks", json=payload, headers=headers, timeout=30)
+    def _poll(endpoint, item_id):
+        MAX_WAIT = 20   # 20 × 3s = 60 seconds max — not 6 minutes
+        for attempt in range(MAX_WAIT):
+            time.sleep(3)
+            try:
+                sr = requests.get(f"{BASE}/{endpoint}/{item_id}", headers=headers, timeout=15)
+                sr.raise_for_status()
+                d  = sr.json()
+                st = d.get("status")
+                logger.info(f"D-ID poll {attempt+1}/{MAX_WAIT}: {st}")
+                if st == "done":
+                    if _download(d.get("result_url", ""), output_path):
+                        logger.info(f"D-ID ✓ via /{endpoint}")
+                        return output_path
+                    return None
+                elif st in ("error", "rejected"):
+                    logger.error(f"D-ID /{endpoint} error: {d.get('error')}")
+                    return None
+            except Exception as e:
+                logger.warning(f"D-ID poll error: {e}")
+        logger.warning(f"D-ID: timed out after {MAX_WAIT * 3}s — falling back to local render")
+        return None
+
+    try:
+        # Attempt 1: Clips API (built-in presenters, no image URL needed)
+        r = requests.post(f"{BASE}/clips", json={
+            "presenter_id": "rian-lZC6MmWfC1",
+            "driver_id": "uM00QS2uzl",
+            "script": script_block,
+            "config": {"fluent": True},
+        }, headers=headers, timeout=30)
+
+        if r.status_code in (200, 201):
+            clip_id = r.json().get("id")
+            if clip_id:
+                result = _poll("clips", clip_id)
+                if result:
+                    return result
+
         if r.status_code == 402:
             logger.warning("D-ID: credits exhausted")
             return None
-        r.raise_for_status()
-        talk_id = r.json()["id"]
-        logger.info(f"D-ID: submitted {talk_id}")
 
-        for _ in range(120):
-            time.sleep(3)
-            sr = requests.get(f"{BASE}/talks/{talk_id}", headers=headers, timeout=15)
-            sr.raise_for_status()
-            d  = sr.json()
-            st = d.get("status")
-            if st == "done":
-                if _download(d.get("result_url", ""), output_path):
-                    logger.info(f"D-ID ✓")
-                    return output_path
-                return None
-            elif st in ("error", "rejected"):
-                logger.error(f"D-ID: {d.get('error')}")
-                return None
+        logger.info(f"D-ID clips status {r.status_code} — trying /talks")
 
-        logger.error("D-ID: timeout")
+        # Attempt 2: /talks with a clean .jpg URL (no query params)
+        for img in [
+            "https://d-id-public-bucket.s3.us-east-1.amazonaws.com/alice.jpg",
+            "https://upload.wikimedia.org/wikipedia/commons/thumb/e/ec/Mona_Lisa%2C_by_Leonardo_da_Vinci%2C_from_C2RMF_retouched.jpg/480px-Mona_Lisa%2C_by_Leonardo_da_Vinci%2C_from_C2RMF_retouched.jpg",
+        ]:
+            r2 = requests.post(f"{BASE}/talks", json={
+                "source_url": img,
+                "script": script_block,
+                "config": {"fluent": True, "stitch": True},
+            }, headers=headers, timeout=30)
+
+            if r2.status_code == 402:
+                logger.warning("D-ID: credits exhausted")
+                return None
+            if r2.status_code in (200, 201):
+                talk_id = r2.json().get("id")
+                if talk_id:
+                    return _poll("talks", talk_id)
+            else:
+                logger.warning(f"D-ID /talks {r2.status_code}: {r2.text[:150]}")
+
         return None
     except Exception as e:
         logger.error(f"D-ID: {e}")
@@ -459,9 +510,9 @@ def generate_with_huggingface(scene_prompt: str, output_path: str) -> Optional[s
     MODELS = [
         {
             "name": "ModelScope-1.7B",
-            "url":  "https://router.huggingface.co/hf-inference/models/damo-vilab/text-to-video-ms-1.7b",
+            "url":  "https://api-inference.huggingface.co/models/damo-vilab/text-to-video-ms-1.7b",
             "body": {
-                "inputs":      scene_prompt[:200],   # keep prompt concise
+                "inputs":      scene_prompt[:200],
                 "parameters": {
                     "num_frames":          16,
                     "num_inference_steps": 25,
@@ -469,12 +520,6 @@ def generate_with_huggingface(scene_prompt: str, output_path: str) -> Optional[s
                 },
             },
         },
-        # Uncomment only if you have a paid HF subscription:
-        # {
-        #     "name": "CogVideoX-5B",
-        #     "url":  "https://router.huggingface.co/hf-inference/models/THUDM/CogVideoX-5b",
-        #     "body": {"inputs": scene_prompt, "parameters": {"num_frames": 49, "fps": 8}},
-        # },
     ]
 
     for model in MODELS:

@@ -220,18 +220,20 @@ def _call_groq(prompt):
     TARGET_WORDS = SENTENCES_PER_CLIP * WORDS_PER_SENTENCE  # goal — 60 words
 
     MODELS = [
-        "llama-3.3-70b-versatile",
-        "gemma2-9b-it",
-        "mixtral-8x7b-32768",
+        "llama-3.3-70b-versatile",   # production
+        "llama-3.1-8b-instant",        # production fallback
     ]
 
     system_msg = (
-        "You are a video script writer that outputs ONLY valid JSON. "
-        "No markdown. No backticks. No preamble. "
-        f"CRITICAL WORD COUNT RULE: The 'script' field MUST contain EXACTLY "
-        f"{SENTENCES_PER_CLIP} sentences. EACH sentence MUST be 18-22 words. "
-        f"Total word count MUST be {TARGET_WORDS - 5} to {TARGET_WORDS + 5} words. "
-        "Count every word carefully. A script under 35 words is WRONG."
+        "You are a video script writer. Output ONLY valid JSON, no markdown, no backticks. "
+        f"The 'script' field must be exactly {SENTENCES_PER_CLIP} sentences with a total of 55-65 words. "
+        f"Here is a PERFECT example of the correct script format and length: "
+        f"'Millions of people worldwide struggle silently with mental health challenges that go completely "
+        f"unrecognised and untreated every single day. "
+        f"Research shows that one in four adults will experience a serious mental health episode at some "
+        f"point during their lifetime. "
+        f"Breaking the stigma starts with a simple conversation — reach out to someone you care about today.' "
+        f"That example is 3 sentences and 64 words. Match that length exactly."
     )
 
     from groq import Groq
@@ -246,8 +248,8 @@ def _call_groq(prompt):
                         {"role": "system", "content": system_msg},
                         {"role": "user",   "content": prompt},
                     ],
-                    temperature=0.72,
-                    max_tokens=700,
+                    temperature=0.68,
+                    max_tokens=800,
                     response_format={"type": "json_object"},
                 )
                 raw  = resp.choices[0].message.content.strip()
@@ -414,8 +416,9 @@ _FALLBACKS = [
         "topic":  "One in four people experiences mental illness every year",
         "script": (
             "Mental illness affects 970 million people worldwide right now, "
-            "yet most never receive any treatment because of stigma. "
-            "Check on a friend today — you cannot always tell who is struggling."
+            "yet the majority never receive any treatment because of widespread social stigma. "
+            "Seven in ten people with a mental health condition suffer in silence without any professional help. "
+            "Check on a friend today — you cannot always tell who is quietly struggling."
         ),
         "scenes": [
             "Person sitting alone on park bench, distant look, soft autumn light",
@@ -429,9 +432,9 @@ _FALLBACKS = [
         "bucket": "social",
         "topic":  "Eight million tonnes of plastic enter our oceans every year",
         "script": (
-            "Every minute, the equivalent of a rubbish truck of plastic is dumped into the ocean. "
-            "By 2050 there will be more plastic in the sea than fish by weight. "
-            "Refusing single-use plastic and supporting clean-ups actually works — start today."
+            "Every minute, the equivalent of a rubbish truck full of plastic is dumped directly into our oceans. "
+            "By 2050 scientists predict there will be more plastic in the sea than fish by total weight. "
+            "Refusing single-use plastic and supporting local clean-up initiatives actually works — start today."
         ),
         "scenes": [
             "Aerial view of plastic debris floating on ocean surface, sobering wide shot",
@@ -447,7 +450,8 @@ _FALLBACKS = [
         "script": (
             "In the last twelve months, artificial intelligence has moved from experiment "
             "to operational reality in healthcare, finance, law and education. "
-            "The greatest economic shift of our lifetime is happening — the window to adapt is narrowing."
+            "The greatest economic shift of our lifetime is unfolding faster than most people realise. "
+            "Companies that embrace AI today will lead tomorrow — the window to adapt is narrowing fast."
         ),
         "scenes": [
             "Futuristic server room with blue glowing lights, data streams, cinematic wide",
@@ -461,9 +465,10 @@ _FALLBACKS = [
         "bucket": "knowledge",
         "topic":  "Your brain physically rewires every time you learn something",
         "script": (
-            "Every time you learn a skill, your brain forms new synaptic connections "
-            "in a process called neuroplasticity. "
-            "The most powerful brain-training tool is not an app — it is genuine curiosity applied consistently."
+            "Every time you learn a new skill, your brain physically forms new synaptic connections "
+            "through a remarkable process that scientists call neuroplasticity. "
+            "Studies show that learning a language or instrument measurably grows the brain's memory centre. "
+            "The most powerful brain-training tool is not an app — it is genuine curiosity applied daily."
         ),
         "scenes": [
             "Glowing neural network visualization, synapses firing, science blue light",
@@ -478,8 +483,9 @@ _FALLBACKS = [
         "topic":  "Trees in a forest communicate underground through fungal networks",
         "script": (
             "Beneath every forest floor lies a vast network of fungal threads "
-            "called mycorrhizae — through which trees share nutrients and send warning signals. "
-            "Forests are not just collections of trees — they are living, communicating communities."
+            "called mycorrhizae — through which trees share nutrients and chemical warning signals. "
+            "Mother trees actively send extra carbon to young seedlings growing in their shade. "
+            "Forests are not just collections of trees — they are living, breathing, communicating communities."
         ),
         "scenes": [
             "Ancient forest floor close-up, visible roots and fungi, rich earth tones",
