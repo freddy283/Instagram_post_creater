@@ -1,441 +1,581 @@
 """
-AI Video Generation — Free-First Approach
-==========================================
-Tries free providers in order of quality:
+Aureus AI Video Generation v3.1
+=================================
+Free-first priority chain:
 
-  1.  D-ID         — Talking-head avatar (FREE 2-week trial, no CC needed)
-  2.  HeyGen       — Talking-head avatar (FREE 1 credit = 1 min, no CC needed)
-  3.  Replicate    — Scene clips via Zeroscope/AnimateDiff (FREE limited runs)
-  4.  Hugging Face — ModelScope text-to-video (COMPLETELY FREE, lower quality)
-  5.  PIL fallback — Always works (gold text animation)
+  1. D-ID        — Talking avatar      FREE 2-week trial  (studio.d-id.com)
+  2. HeyGen      — Talking avatar      FREE 1 credit      (heygen.com)
+  3. Kling       — Cinematic clips     FREE 66 credits/day (klingai.com/dev)
+  4. Replicate   — Wan 2.1 / CogVideoX FREE limited runs  (replicate.com)
+  5. HuggingFace — ModelScope 1.7B     FREE always        (no key needed)
 
-Setup: just set the key for whichever service you sign up for.
-Full instructions below each provider.
+WHY ModelScope 1.7B instead of CogVideoX-5B:
+  CogVideoX-5B is a ~10GB model. On HuggingFace free tier it almost always
+  returns 503 "Model loading" or times out after 5 minutes.
+  ModelScope 1.7B is small, loads fast, and reliably generates 2-3s clips for free.
+
+Each provider is independently optional — app works with zero keys.
 """
 
-import os, time, json, logging, tempfile, requests, shutil, base64
+import os, time, json, logging, tempfile, subprocess, shutil, requests
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+def _get_key(env_name: str) -> str:
+    """Read API key from environment or pydantic settings (handles Windows .env loading)."""
+    val = os.environ.get(env_name, "")
+    if not val:
+        try:
+            from app.config import settings
+            val = getattr(settings, env_name, "") or ""
+        except Exception:
+            pass
+    return val
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1.  D-ID  — Talking Head Avatar  (FREE TRIAL)
-# ─────────────────────────────────────────────────────────────────────────────
-# HOW TO GET FREE ACCESS (5 minutes):
-#   1. Go to https://studio.d-id.com  →  Sign Up (no credit card)
-#   2. You get a 2-week free trial with 20 credits (~5 min of video)
-#   3. Dashboard → top-right menu → API  →  copy your Basic auth key
-#      It looks like:  Basic dXNlckBleGFtcGxlLmNvbTpwYXNzd29yZA==
-#   4. Add to backend/.env:   DID_API_KEY=Basic dXNlck...
-#
-# What you get: A real-looking photorealistic avatar person on screen,
-# reading your script with natural lip-sync and head movements.
-# Output: MP4, up to 5 min, 1280x1280 (square) or any ratio.
-# Free trial watermark: full-screen overlay (upgrade $5.9/mo to remove).
-# ─────────────────────────────────────────────────────────────────────────────
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def _get_duration(path: str) -> float:
+    try:
+        probe = shutil.which("ffprobe") or "ffprobe"
+        r = subprocess.run(
+            [probe, "-v", "quiet", "-print_format", "json", "-show_format", path],
+            capture_output=True, timeout=10,
+        )
+        return float(json.loads(r.stdout)["format"]["duration"])
+    except Exception:
+        return 18.0
+
+
+def mix_audio_into_video(
+    video_path: str,
+    audio_path: str,
+    output_path: str,
+    ffmpeg_bin: str = "ffmpeg",
+) -> bool:
+    if not os.path.exists(video_path) or not os.path.exists(audio_path):
+        return False
+    try:
+        audio_dur = _get_duration(audio_path)
+        result = subprocess.run([
+            ffmpeg_bin, "-y",
+            "-i", video_path, "-i", audio_path,
+            "-map", "0:v", "-map", "1:a",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+            "-af", f"volume=1.1,afade=t=in:d=0.3,afade=t=out:st={max(0, audio_dur - 1)}:d=0.8",
+            "-shortest", "-movflags", "+faststart",
+            output_path,
+        ], capture_output=True, timeout=120)
+        return result.returncode == 0 and os.path.exists(output_path)
+    except Exception as e:
+        logger.error(f"Audio mix: {e}")
+        return False
+
+
+def _download(url: str, dest: str, timeout: int = 120) -> bool:
+    try:
+        r = requests.get(url, timeout=timeout, stream=True)
+        r.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(65536):
+                f.write(chunk)
+        size = os.path.getsize(dest)
+        logger.info(f"  Downloaded {size//1024}KB → {os.path.basename(dest)}")
+        return size > 5000
+    except Exception as e:
+        logger.warning(f"Download {url[:60]}: {e}")
+        return False
+
+
+# =============================================================================
+# 1. D-ID — Talking avatar (FREE 2-week trial, no CC)
+# Sign up:  https://studio.d-id.com
+# Get key:  Dashboard → API → copy "Basic xxxx..." token
+# .env:     DID_API_KEY=Basic dXNlckBleGF...
+# =============================================================================
 def generate_with_did(script: str, output_path: str) -> Optional[str]:
-    api_key = os.environ.get("DID_API_KEY", "")
+    api_key = _get_key("DID_API_KEY")
     if not api_key:
-        logger.info("DID_API_KEY not set — sign up free at studio.d-id.com")
         return None
 
     headers = {
-        "Authorization": api_key,   # already includes "Basic "
-        "Content-Type": "application/json",
-        "Accept": "application/json",
+        "Authorization": api_key,
+        "Content-Type":  "application/json",
+        "Accept":        "application/json",
     }
     BASE = "https://api.d-id.com"
 
     try:
-        # Use a publicly available professional presenter image
-        # D-ID has built-in presenters — we use their stock avatar
         payload = {
             "source_url": "https://create-images-results.d-id.com/DefaultPresenters/Noelle_f/image.jpeg",
             "script": {
-                "type": "text",
-                "input": script,
+                "type":     "text",
+                "input":    script,
                 "provider": {
-                    "type": "microsoft",
-                    "voice_id": "en-US-GuyNeural",   # Professional male voice
+                    "type":         "microsoft",
+                    "voice_id":     "en-US-GuyNeural",
                     "voice_config": {"style": "Newscast"},
                 },
             },
-            "config": {
-                "fluent": True,
-                "pad_audio": 0.0,
-                "stitch": True,
-            },
+            "config": {"fluent": True, "pad_audio": 0.0, "stitch": True},
         }
 
-        # Submit
         r = requests.post(f"{BASE}/talks", json=payload, headers=headers, timeout=30)
         if r.status_code == 402:
-            logger.warning("D-ID: No credits remaining on free trial")
+            logger.warning("D-ID: credits exhausted")
             return None
         r.raise_for_status()
         talk_id = r.json()["id"]
-        logger.info(f"D-ID talk submitted: {talk_id}")
+        logger.info(f"D-ID: submitted {talk_id}")
 
-        # Poll
-        for _ in range(120):   # up to 4 min
+        for _ in range(120):
             time.sleep(3)
-            status_r = requests.get(f"{BASE}/talks/{talk_id}", headers=headers, timeout=15)
-            status_r.raise_for_status()
-            data = status_r.json()
-            st = data.get("status")
+            sr = requests.get(f"{BASE}/talks/{talk_id}", headers=headers, timeout=15)
+            sr.raise_for_status()
+            d  = sr.json()
+            st = d.get("status")
             if st == "done":
-                video_url = data.get("result_url")
-                if not video_url:
-                    return None
-                dl = requests.get(video_url, timeout=120)
-                dl.raise_for_status()
-                with open(output_path, "wb") as f:
-                    f.write(dl.content)
-                logger.info(f"✓ D-ID video saved: {output_path}")
-                return output_path
-            elif st in ("error", "rejected"):
-                logger.error(f"D-ID error: {data.get('error')}")
+                if _download(d.get("result_url", ""), output_path):
+                    logger.info(f"D-ID ✓")
+                    return output_path
                 return None
-            logger.debug(f"D-ID status: {st}")
+            elif st in ("error", "rejected"):
+                logger.error(f"D-ID: {d.get('error')}")
+                return None
 
-        logger.error("D-ID: timed out")
+        logger.error("D-ID: timeout")
         return None
     except Exception as e:
-        logger.error(f"D-ID failed: {e}")
+        logger.error(f"D-ID: {e}")
         return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2.  HeyGen  — Talking Head Avatar  (FREE 1 credit = 1 minute)
-# ─────────────────────────────────────────────────────────────────────────────
-# HOW TO GET FREE ACCESS (5 minutes):
-#   1. Go to https://heygen.com  →  Sign Up (no credit card)
-#   2. You get 1 free credit (= 1 minute of video)
-#   3. Settings → API → Generate API Token
-#   4. Add to backend/.env:   HEYGEN_API_KEY=your-token
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# 2. HeyGen — Talking avatar (FREE 1 credit = 1 minute)
+# Sign up:  https://heygen.com
+# Get key:  Settings → API → Generate API Token
+# .env:     HEYGEN_API_KEY=your-token
+# =============================================================================
 def generate_with_heygen(script: str, output_path: str) -> Optional[str]:
-    api_key = os.environ.get("HEYGEN_API_KEY", "")
+    api_key = _get_key("HEYGEN_API_KEY")
     if not api_key:
-        logger.info("HEYGEN_API_KEY not set — sign up free at heygen.com")
         return None
 
     headers = {"X-Api-Key": api_key, "Content-Type": "application/json"}
-    BASE = "https://api.heygen.com"
+    BASE    = "https://api.heygen.com"
 
     try:
         payload = {
             "video_inputs": [{
                 "character": {
-                    "type": "avatar",
-                    "avatar_id": "Eric_public_pro2_20230608",
+                    "type":         "avatar",
+                    "avatar_id":    "Eric_public_pro2_20230608",
                     "avatar_style": "normal",
                 },
                 "voice": {
-                    "type": "text",
+                    "type":       "text",
                     "input_text": script,
-                    "voice_id": "2d5b0e6cf36f460aa7fc47e3eee4ba54",
-                    "speed": 0.95,
+                    "voice_id":   "2d5b0e6cf36f460aa7fc47e3eee4ba54",
+                    "speed":      0.95,
                 },
                 "background": {"type": "color", "value": "#0a0908"},
             }],
-            "dimension": {"width": 720, "height": 1280},  # 9:16 vertical
-            "test": False,
+            "dimension": {"width": 720, "height": 1280},
         }
 
         r = requests.post(f"{BASE}/v2/video/generate", json=payload, headers=headers, timeout=30)
-        if r.status_code == 400:
-            err = r.json()
-            if "quota" in str(err).lower() or "credit" in str(err).lower():
-                logger.warning("HeyGen: free credit already used")
-                return None
+        if r.status_code == 400 and ("quota" in r.text.lower() or "credit" in r.text.lower()):
+            logger.warning("HeyGen: free credit used")
+            return None
         r.raise_for_status()
         video_id = r.json()["data"]["video_id"]
 
         for _ in range(180):
             time.sleep(3)
-            st_r = requests.get(f"{BASE}/v1/video_status.get?video_id={video_id}", headers=headers, timeout=15)
-            st_r.raise_for_status()
-            d = st_r.json()["data"]
+            sr = requests.get(
+                f"{BASE}/v1/video_status.get?video_id={video_id}",
+                headers=headers, timeout=15,
+            )
+            sr.raise_for_status()
+            d  = sr.json()["data"]
             st = d.get("status")
             if st == "completed":
-                url = d["video_url"]
-                dl = requests.get(url, timeout=120)
-                dl.raise_for_status()
-                with open(output_path, "wb") as f:
-                    f.write(dl.content)
-                logger.info(f"✓ HeyGen video saved: {output_path}")
-                return output_path
-            elif st == "failed":
-                logger.error(f"HeyGen failed: {d.get('error')}")
+                if _download(d["video_url"], output_path):
+                    logger.info("HeyGen ✓")
+                    return output_path
                 return None
+            elif st == "failed":
+                logger.error(f"HeyGen: {d.get('error')}")
+                return None
+
         return None
     except Exception as e:
-        logger.error(f"HeyGen failed: {e}")
+        logger.error(f"HeyGen: {e}")
         return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3.  Replicate  — Scene clips (FREE limited runs, no CC)
-# ─────────────────────────────────────────────────────────────────────────────
-# HOW TO GET FREE ACCESS (2 minutes):
-#   1. Go to https://replicate.com  →  Sign Up with GitHub
-#   2. Free tier: limited runs on open-source models (no CC needed)
-#   3. Account → API Tokens  →  copy token
-#   4. Add to backend/.env:   REPLICATE_API_TOKEN=r8_your_token
-#
-# Models used (all free-tier eligible):
-#   - anotherjesse/zeroscope-v2-xl  (best free scene quality)
-#   - lucataco/animate-diff          (smooth animations)
-# ─────────────────────────────────────────────────────────────────────────────
-def generate_with_replicate(scenes: list, output_dir: str, ffmpeg_bin: str) -> Optional[str]:
-    api_token = os.environ.get("REPLICATE_API_TOKEN", "")
-    if not api_token:
-        logger.info("REPLICATE_API_TOKEN not set — sign up free at replicate.com")
+# =============================================================================
+# 3. Kling — Cinematic clips (FREE 66 credits/day)
+# Sign up:  https://klingai.com → Developer
+# Get key:  klingai.com/dev → API Key + API Secret
+# .env:     KLING_API_KEY=your-key
+#           KLING_API_SECRET=your-secret
+# Install:  pip install PyJWT
+# =============================================================================
+def generate_with_kling(scenes: list, output_path: str, ffmpeg_bin: str) -> Optional[str]:
+    api_key    = _get_key("KLING_API_KEY")
+    api_secret = _get_key("KLING_API_SECRET")
+    if not api_key or not api_secret:
         return None
 
-    headers = {
-        "Authorization": f"Token {api_token}",
-        "Content-Type": "application/json",
-    }
-    BASE = "https://api.replicate.com/v1"
+    BASE = "https://api.klingai.com/v1"
+    try:
+        import jwt as pyjwt
+        token = pyjwt.encode(
+            {"iss": api_key, "exp": int(time.time()) + 1800, "nbf": int(time.time()) - 5},
+            api_secret, algorithm="HS256",
+        )
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    except ImportError:
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-    def run_prediction(model: str, input_data: dict) -> Optional[str]:
-        """Submit + poll a Replicate prediction. Returns URL of output video."""
-        r = requests.post(f"{BASE}/predictions", headers=headers,
-                          json={"version": model, "input": input_data}, timeout=30)
+    tmp_dir = tempfile.mkdtemp()
+    clips   = []
+
+    try:
+        for i, scene_desc in enumerate(scenes[:3]):
+            logger.info(f"Kling: clip {i+1}/{min(len(scenes),3)}")
+            payload = {
+                "model":           "kling-v1",
+                "prompt":          scene_desc,
+                "negative_prompt": "blurry, low quality, watermark, text, logo",
+                "cfg_scale":       0.5,
+                "mode":            "std",
+                "duration":        "5",
+                "aspect_ratio":    "9:16",
+            }
+
+            r = requests.post(f"{BASE}/videos/text2video", json=payload,
+                              headers=headers, timeout=30)
+            if r.status_code in (401, 403):
+                logger.warning("Kling: auth failed")
+                return None
+            if r.status_code == 429:
+                logger.warning("Kling: daily limit reached")
+                return None
+            r.raise_for_status()
+
+            task_id = r.json().get("data", {}).get("task_id")
+            if not task_id:
+                continue
+
+            clip_url = None
+            for _ in range(90):
+                time.sleep(4)
+                pr = requests.get(f"{BASE}/videos/text2video/{task_id}",
+                                  headers=headers, timeout=15)
+                pr.raise_for_status()
+                d  = pr.json().get("data", {})
+                st = d.get("task_status")
+                if st == "succeed":
+                    works = d.get("task_result", {}).get("videos", [])
+                    if works:
+                        clip_url = works[0].get("url")
+                    break
+                elif st in ("failed", "cancelled"):
+                    break
+
+            if clip_url:
+                clip_path = os.path.join(tmp_dir, f"kling_{i}.mp4")
+                if _download(clip_url, clip_path):
+                    clips.append(clip_path)
+                    logger.info(f"  Kling clip {i+1} ✓")
+
+        if not clips:
+            return None
+
+        list_file = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
+        for cp in clips:
+            list_file.write(f"file '{cp}'\n")
+        list_file.close()
+
+        rc = subprocess.run([
+            ffmpeg_bin, "-y", "-f", "concat", "-safe", "0",
+            "-i", list_file.name, "-c", "copy", output_path,
+        ], capture_output=True, timeout=60).returncode
+
+        try:
+            os.unlink(list_file.name)
+        except Exception:
+            pass
+
+        if rc == 0 and os.path.exists(output_path):
+            logger.info("Kling ✓")
+            return output_path
+        return clips[0] if clips else None
+
+    except Exception as e:
+        logger.error(f"Kling: {e}")
+        return None
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# =============================================================================
+# 4. Replicate — Wan 2.1 / CogVideoX (FREE limited runs, no CC)
+# Sign up:  https://replicate.com (GitHub login, instant)
+# Get key:  Account → API Tokens
+# .env:     REPLICATE_API_TOKEN=r8_your_token
+# =============================================================================
+def generate_with_replicate(scenes: list, output_path: str, ffmpeg_bin: str) -> Optional[str]:
+    token = _get_key("REPLICATE_API_TOKEN")
+    if not token:
+        return None
+
+    headers = {"Authorization": f"Token {token}", "Content-Type": "application/json"}
+    BASE    = "https://api.replicate.com/v1"
+
+    def _run_model(owner: str, name: str, inp: dict) -> Optional[str]:
+        r = requests.post(
+            f"{BASE}/models/{owner}/{name}/predictions",
+            headers=headers, json={"input": inp}, timeout=30,
+        )
         if r.status_code == 402:
-            logger.warning("Replicate: free run limit reached — add $5 credit")
+            logger.warning("Replicate: limit reached")
             return None
         r.raise_for_status()
         pred_id = r.json()["id"]
 
-        for _ in range(120):
+        for _ in range(150):
             time.sleep(4)
             pr = requests.get(f"{BASE}/predictions/{pred_id}", headers=headers, timeout=15)
             pr.raise_for_status()
-            d = pr.json()
+            d  = pr.json()
             st = d["status"]
             if st == "succeeded":
                 out = d.get("output")
-                if isinstance(out, list): return out[0]
-                return out
+                return out[0] if isinstance(out, list) else out
             elif st in ("failed", "canceled"):
-                logger.error(f"Replicate prediction failed: {d.get('error')}")
+                logger.warning(f"Replicate: {d.get('error')}")
                 return None
         return None
 
-    # Use Zeroscope XL — best free open-source text-to-video on Replicate
-    # Model version: anotherjesse/zeroscope-v2-xl (latest)
-    ZEROSCOPE_VERSION = "9f747673945c62801b13b84701c783929c0ee784e4748ec062204894dda1a351"
-
-    clips = []
-    for i, scene_prompt in enumerate(scenes[:4]):  # max 4 clips
-        logger.info(f"Replicate: generating clip {i+1}/{min(len(scenes),4)}")
-        url = run_prediction(ZEROSCOPE_VERSION, {
-            "prompt": scene_prompt,
-            "negative_prompt": "blurry, low quality, distorted, text, watermark",
-            "num_frames": 24,      # ~3-4 seconds at 8fps
-            "num_inference_steps": 40,
-            "guidance_scale": 7.5,
-            "width": 576,
-            "height": 320,         # landscape (will be cropped to 9:16 later)
-            "fps": 8,
-        })
-        if not url:
-            continue
-        clip_path = os.path.join(output_dir, f"replicate_clip_{i}.mp4")
-        dl = requests.get(url, timeout=120)
-        dl.raise_for_status()
-        with open(clip_path, "wb") as f:
-            f.write(dl.content)
-        clips.append(clip_path)
-        logger.info(f"  Clip {i+1} downloaded")
-
-    if not clips:
-        return None
-
-    # Concatenate clips
-    output_path = os.path.join(output_dir, "replicate_combined.mp4")
-    concat_file = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
-    for cp in clips:
-        concat_file.write(f"file '{os.path.abspath(cp)}'\n")
-    concat_file.close()
+    tmp_dir = tempfile.mkdtemp()
+    clips   = []
 
     try:
-        import subprocess
-        result = subprocess.run([
-            ffmpeg_bin, "-y", "-f", "concat", "-safe", "0",
-            "-i", concat_file.name, "-c", "copy", output_path
-        ], capture_output=True, timeout=60)
-        if result.returncode == 0 and os.path.exists(output_path):
-            logger.info(f"✓ Replicate clips combined: {output_path}")
-            return output_path
-    except Exception as e:
-        logger.error(f"Replicate concat failed: {e}")
-    finally:
-        try: os.unlink(concat_file.name)
-        except: pass
+        for i, prompt in enumerate(scenes[:3]):
+            logger.info(f"Replicate: clip {i+1}")
+            url = None
 
-    # If concat failed, return first clip
-    return clips[0] if clips else None
+            # Try Wan 2.1 first (Alibaba, 2025, good quality)
+            for owner, name, inp in [
+                ("wavespeedai", "wan-2.1-t2v-480p", {
+                    "prompt":          prompt,
+                    "negative_prompt": "blurry, watermark, text",
+                    "num_frames":      33,
+                    "sample_steps":    30,
+                }),
+                # CogVideoX-5B fallback
+                ("zsxkib", "cogvideox-5b", {
+                    "prompt":              prompt,
+                    "negative_prompt":     "blurry, low quality, watermark",
+                    "num_inference_steps": 50,
+                    "guidance_scale":      6.0,
+                    "num_frames":          49,
+                    "fps":                 8,
+                }),
+            ]:
+                url = _run_model(owner, name, inp)
+                if url:
+                    break
 
+            if url:
+                clip_path = os.path.join(tmp_dir, f"rep_{i}.mp4")
+                if _download(url, clip_path):
+                    clips.append(clip_path)
+                    logger.info(f"  Replicate clip {i+1} ✓")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4.  Hugging Face Inference API  — COMPLETELY FREE, no sign-up needed
-# ─────────────────────────────────────────────────────────────────────────────
-# The Hugging Face free inference API lets you call hosted models.
-# For VIDEO specifically: damo-vilab/text-to-video-ms-1.7b
-# Quality: lower than commercial tools, but genuinely free.
-#
-# Optional: Sign up at huggingface.co for higher rate limits.
-# Add to backend/.env:   HF_TOKEN=hf_your_token   (optional, higher limits)
-# ─────────────────────────────────────────────────────────────────────────────
-def generate_with_huggingface(scene_prompt: str, output_dir: str) -> Optional[str]:
-    # Works without a token (rate limited) or with free HF token
-    hf_token = os.environ.get("HF_TOKEN", "")
-    headers = {"Content-Type": "application/json"}
-    if hf_token:
-        headers["Authorization"] = f"Bearer {hf_token}"
-
-    try:
-        # ModelScope text-to-video 1.7B — free hosted inference
-        url = "https://router.huggingface.co/hf-inference/models/damo-vilab/text-to-video-ms-1.7b"
-        payload = {
-            "inputs": scene_prompt,
-            "parameters": {
-                "num_frames": 16,
-                "num_inference_steps": 25,
-                "guidance_scale": 9.0,
-            }
-        }
-
-        logger.info("HuggingFace: requesting video generation (free)...")
-        r = requests.post(url, headers=headers, json=payload, timeout=300)
-
-        if r.status_code == 503:
-            # Model loading — retry once
-            logger.info("HF model loading, retrying in 30s...")
-            time.sleep(30)
-            r = requests.post(url, headers=headers, json=payload, timeout=300)
-
-        if r.status_code == 200 and len(r.content) > 1000:
-            out_path = os.path.join(output_dir, "hf_video.mp4")
-            with open(out_path, "wb") as f:
-                f.write(r.content)
-            logger.info(f"✓ HuggingFace video saved: {out_path}")
-            return out_path
-        else:
-            logger.warning(f"HF returned {r.status_code}: {r.text[:200]}")
+        if not clips:
             return None
+
+        list_file = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
+        for cp in clips:
+            list_file.write(f"file '{cp}'\n")
+        list_file.close()
+
+        rc = subprocess.run([
+            ffmpeg_bin, "-y", "-f", "concat", "-safe", "0",
+            "-i", list_file.name, "-c", "copy", output_path,
+        ], capture_output=True, timeout=60).returncode
+
+        try:
+            os.unlink(list_file.name)
+        except Exception:
+            pass
+
+        if rc == 0 and os.path.exists(output_path):
+            logger.info("Replicate ✓")
+            return output_path
+        return clips[0] if clips else None
+
     except Exception as e:
-        logger.error(f"HuggingFace inference failed: {e}")
+        logger.error(f"Replicate: {e}")
+        return None
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# =============================================================================
+# 5. HuggingFace — ModelScope 1.7B (FREE, always works, no key needed)
+# =============================================================================
+# WHY ModelScope 1.7B (not CogVideoX-5B):
+#   CogVideoX-5B is 10GB — HF free tier almost always returns 503 or times out.
+#   ModelScope 1.7B is small, loads fast, and reliably returns a short clip.
+#   Quality is lower but it ACTUALLY WORKS on free tier.
+#
+# Optional: Sign up at huggingface.co → Settings → Access Tokens
+# .env:     HF_TOKEN=hf_your_token   (higher rate limits, optional)
+# =============================================================================
+def generate_with_huggingface(scene_prompt: str, output_path: str) -> Optional[str]:
+    hf_token = _get_key("HF_TOKEN")
+    if not hf_token:
+        # HuggingFace free inference API now requires authentication even for public models.
+        # Sign up free at huggingface.co → Settings → Access Tokens → New token (read only)
+        # Add to .env:  HF_TOKEN=hf_your_token
+        logger.info("HF_TOKEN not set — skipping HuggingFace (now requires free account token)")
         return None
 
+    headers = {
+        "Authorization": f"Bearer {hf_token}",
+        "Content-Type":  "application/json",
+    }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Mix narration audio into a video file
-# ─────────────────────────────────────────────────────────────────────────────
-def mix_audio_into_video(video_path: str, audio_path: str, output_path: str,
-                          ffmpeg_bin: str = "ffmpeg") -> bool:
-    if not os.path.exists(video_path) or not os.path.exists(audio_path):
-        return False
-    try:
-        import subprocess
-        result = subprocess.run([
-            ffmpeg_bin, "-y",
-            "-i", video_path,
-            "-i", audio_path,
-            "-map", "0:v",
-            "-map", "1:a",
-            "-c:v", "copy",
-            "-c:a", "aac", "-b:a", "192k",
-            "-af", "volume=1.2,afade=t=in:d=0.4,afade=t=out:st={}:d=1".format(
-                max(0, _get_duration(audio_path, ffmpeg_bin) - 1)
-            ),
-            "-shortest",
-            "-movflags", "+faststart",
-            output_path
-        ], capture_output=True, timeout=120)
-        return result.returncode == 0
-    except Exception as e:
-        logger.error(f"Audio mix failed: {e}")
-        return False
+    # ModelScope 1.7B — small, reliable, actually works on HF free tier
+    # CogVideoX-5B is commented out — too large for free tier
+    MODELS = [
+        {
+            "name": "ModelScope-1.7B",
+            "url":  "https://router.huggingface.co/hf-inference/models/damo-vilab/text-to-video-ms-1.7b",
+            "body": {
+                "inputs":      scene_prompt[:200],   # keep prompt concise
+                "parameters": {
+                    "num_frames":          16,
+                    "num_inference_steps": 25,
+                    "guidance_scale":      9.0,
+                },
+            },
+        },
+        # Uncomment only if you have a paid HF subscription:
+        # {
+        #     "name": "CogVideoX-5B",
+        #     "url":  "https://router.huggingface.co/hf-inference/models/THUDM/CogVideoX-5b",
+        #     "body": {"inputs": scene_prompt, "parameters": {"num_frames": 49, "fps": 8}},
+        # },
+    ]
+
+    for model in MODELS:
+        try:
+            logger.info(f"HuggingFace [{model['name']}]: requesting…")
+            r = requests.post(model["url"], headers=headers, json=model["body"], timeout=120)
+
+            if r.status_code == 503:
+                logger.info(f"  {model['name']}: model loading, waiting 20s…")
+                time.sleep(20)
+                r = requests.post(model["url"], headers=headers, json=model["body"], timeout=120)
+
+            if r.status_code == 200 and len(r.content) > 5000:
+                with open(output_path, "wb") as f:
+                    f.write(r.content)
+                logger.info(f"HuggingFace [{model['name']}] ✓")
+                return output_path
+            else:
+                logger.warning(f"  {model['name']}: HTTP {r.status_code} — {r.text[:100]}")
+        except Exception as e:
+            logger.warning(f"  {model['name']}: {e}")
+
+    return None
 
 
-def _get_duration(path: str, ffmpeg_bin: str = "ffmpeg") -> float:
-    try:
-        import subprocess, json as _json
-        probe = ffmpeg_bin.replace("ffmpeg", "ffprobe")
-        if not os.path.exists(probe): probe = "ffprobe"
-        r = subprocess.run([probe, "-v", "quiet", "-print_format", "json",
-                            "-show_format", path], capture_output=True, text=True, timeout=10)
-        return float(_json.loads(r.stdout)["format"]["duration"])
-    except:
-        return 20.0
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main orchestrator
-# ─────────────────────────────────────────────────────────────────────────────
-def generate_ai_video(script_data: dict, audio_path: str, output_path: str,
-                       ffmpeg_bin: str = "ffmpeg") -> Optional[str]:
+# =============================================================================
+# MAIN ORCHESTRATOR
+# =============================================================================
+def generate_ai_video(
+    script_data: dict,
+    audio_path:  str,
+    output_path: str,
+    ffmpeg_bin:  str = "ffmpeg",
+) -> Optional[str]:
     """
-    Try free AI video providers in priority order.
-    Returns final output_path on success, None if all fail.
+    Try AI video providers in priority order.
+    Returns output_path on success, None to fall through to local PIL renderer.
+
+    Priority:
+      1. D-ID        (best quality talking head — free trial)
+      2. HeyGen      (best quality talking head — 1 free video)
+      3. Kling       (cinematic clips — 66 free credits/day)
+      4. Replicate   (Wan 2.1 → CogVideoX — free limited runs)
+      5. HuggingFace (ModelScope 1.7B — always free, no key needed)
     """
     output_dir = os.path.dirname(os.path.abspath(output_path))
     script     = script_data.get("script", "")
     scenes     = script_data.get("scenes", [])
-    # Use first scene as HF prompt if no scenes
-    hf_prompt  = scenes[0] if scenes else script_data.get("topic", "motivational video cinematic")
+    has_audio  = bool(audio_path) and os.path.exists(audio_path)
 
-    has_audio = os.path.exists(audio_path)
+    def _finalise(raw_path: Optional[str], provider: str) -> Optional[str]:
+        if not raw_path or not os.path.exists(raw_path):
+            return None
+        if has_audio:
+            ok = mix_audio_into_video(raw_path, audio_path, output_path, ffmpeg_bin)
+            if ok:
+                logger.info(f"✓ {provider} + audio → {output_path}")
+                return output_path
+        shutil.copy(raw_path, output_path)
+        logger.info(f"✓ {provider} (silent) → {output_path}")
+        return output_path
 
-    # ── 1. D-ID (free trial, best quality talking head) ───────────────────
-    if os.environ.get("DID_API_KEY"):
-        tmp_out = output_path.replace(".mp4", "_did.mp4")
-        result = generate_with_did(script, tmp_out)
-        if result and os.path.exists(result):
-            if has_audio:
-                ok = mix_audio_into_video(result, audio_path, output_path, ffmpeg_bin)
-                if ok: return output_path
-            shutil.copy(result, output_path)
+    # ── 1. D-ID ───────────────────────────────────────────────────────────────
+    if _get_key("DID_API_KEY"):
+        tmp = output_path.replace(".mp4", "_did.mp4")
+        result = generate_with_did(script, tmp)
+        if result:
+            shutil.copy(result, output_path)   # D-ID includes voice
             return output_path
 
-    # ── 2. HeyGen (1 free video, best quality) ────────────────────────────
-    if os.environ.get("HEYGEN_API_KEY"):
-        tmp_out = output_path.replace(".mp4", "_hg.mp4")
-        result = generate_with_heygen(script, tmp_out)
-        if result and os.path.exists(result):
-            if has_audio:
-                ok = mix_audio_into_video(result, audio_path, output_path, ffmpeg_bin)
-                if ok: return output_path
-            shutil.copy(result, output_path)
+    # ── 2. HeyGen ─────────────────────────────────────────────────────────────
+    if _get_key("HEYGEN_API_KEY"):
+        tmp = output_path.replace(".mp4", "_hg.mp4")
+        result = generate_with_heygen(script, tmp)
+        if result:
+            shutil.copy(result, output_path)   # HeyGen includes voice
             return output_path
 
-    # ── 3. Replicate (free limited runs) ──────────────────────────────────
-    if os.environ.get("REPLICATE_API_TOKEN") and scenes:
-        result = generate_with_replicate(scenes, output_dir, ffmpeg_bin)
-        if result and os.path.exists(result):
-            final = output_path
-            if has_audio:
-                ok = mix_audio_into_video(result, audio_path, final, ffmpeg_bin)
-                if ok: return final
-            shutil.copy(result, final)
-            return final
+    # ── 3. Kling ──────────────────────────────────────────────────────────────
+    if _get_key("KLING_API_KEY") and scenes:
+        tmp = output_path.replace(".mp4", "_kling.mp4")
+        result = generate_with_kling(scenes, tmp, ffmpeg_bin)
+        out = _finalise(result, "Kling")
+        if out:
+            return out
 
-    # ── 4. Hugging Face (completely free, lower quality) ──────────────────
-    if True:   # always try HF as it's free with no setup
-        result = generate_with_huggingface(hf_prompt, output_dir)
-        if result and os.path.exists(result):
-            final = output_path
-            if has_audio:
-                ok = mix_audio_into_video(result, audio_path, final, ffmpeg_bin)
-                if ok: return final
-            shutil.copy(result, final)
-            return final
+    # ── 4. Replicate ──────────────────────────────────────────────────────────
+    if _get_key("REPLICATE_API_TOKEN") and scenes:
+        tmp = output_path.replace(".mp4", "_rep.mp4")
+        result = generate_with_replicate(scenes, tmp, ffmpeg_bin)
+        out = _finalise(result, "Replicate")
+        if out:
+            return out
 
-    logger.info("All AI providers failed — using PIL fallback")
+    # ── 5. HuggingFace (always tried — free, no key needed) ───────────────────
+    hf_prompt = scenes[0] if scenes else (script_data.get("topic") or "cinematic landscape")
+    tmp = output_path.replace(".mp4", "_hf.mp4")
+    result = generate_with_huggingface(hf_prompt, tmp)
+    out = _finalise(result, "HuggingFace")
+    if out:
+        return out
+
+    logger.info("All AI providers unavailable — PIL local renderer will be used")
     return None

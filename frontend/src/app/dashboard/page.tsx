@@ -248,14 +248,20 @@ function TodayTab({ user }: { user: any }) {
       {hasVideo && !isGenerating && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           <div style={{ background: '#0a0908', border: '1px solid #2a2720', borderRadius: 16, overflow: 'hidden' }}>
-            <div style={{ position: 'relative', paddingBottom: '177.78%', maxHeight: 480, overflow: 'hidden' }}>
-              <video key={statusData?.quote} src="http://127.0.0.1:8000/api/video/stream" controls playsInline
-                style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', objectFit: 'contain' }} />
-            </div>
+            <video
+              key="aureus-preview"
+              src={`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/video/stream?token=${typeof window !== 'undefined' ? localStorage.getItem('aureus_token') || '' : ''}&t=${Date.now()}`}
+              controls
+              playsInline
+              style={{ width: '100%', maxHeight: 520, display: 'block', objectFit: 'contain', background: '#000' }}
+            />
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-            <a href="http://127.0.0.1:8000/api/video/download" target="_blank" rel="noopener noreferrer"
-              className="btn btn-gold rounded-xl" style={{ height: 48, fontSize: 13, fontWeight: 700, textDecoration: 'none', gap: 6 }}>
+            <a
+              href={`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/video/download?token=${typeof window !== 'undefined' ? localStorage.getItem('aureus_token') || '' : ''}`}
+              target="_blank" rel="noopener noreferrer"
+              className="btn btn-gold rounded-xl"
+              style={{ height: 48, fontSize: 13, fontWeight: 700, textDecoration: 'none', gap: 6 }}>
               <span className="material-symbols-outlined" style={{ fontSize: 20 }}>download</span>
               Download Video
             </a>

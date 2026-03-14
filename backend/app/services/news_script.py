@@ -142,17 +142,17 @@ RSS_FEEDS = [
 # The strict timing instruction injected into every prompt
 # ----------------------------------------------------------------------------
 _TIMING_RULE = f"""
-STRICT TIMING RULE — THIS IS CRITICAL:
-- Write EXACTLY {SENTENCES_PER_CLIP} sentences. No more, no fewer.
-- Each sentence must be ~{WORDS_PER_SENTENCE} words (short, punchy, spoken-word style).
-- Total script: ~{SENTENCES_PER_CLIP * WORDS_PER_SENTENCE} words.
-- When read aloud at a calm pace this must take {TARGET_DURATION_S-3}–{TARGET_DURATION_S+2} seconds.
-- DO NOT write long sentences. DO NOT add a 4th sentence. Count your words.
+STRICT TIMING RULE — READ CAREFULLY:
+- The "script" field must be EXACTLY {SENTENCES_PER_CLIP} sentences separated by periods.
+- Each sentence must be 18 to 22 words long. Count every word.
+- EXAMPLE of correct length sentence (20 words): "Scientists have discovered that the human brain can form new neural connections at any age with consistent practice."
+- Total script word count: {SENTENCES_PER_CLIP * WORDS_PER_SENTENCE - 5} to {SENTENCES_PER_CLIP * WORDS_PER_SENTENCE + 10} words.
+- A script with fewer than 40 words total is INCORRECT and will be rejected.
 """
 
 _JSON_SCHEMA = """{
   "topic":  "Punchy video headline — max 10 words",
-  "script": "Exactly 3 sentences, ~60 words total, spoken-word style, no hashtags",
+  "script": "EXACTLY 3 sentences. Each sentence is 18-22 words. Total: 54-66 words. No hashtags.",
   "scenes": [
     "Scene 1 visual for sentence 1 — location, lighting, mood (detail it)",
     "Scene 2 visual for sentence 2",
@@ -202,44 +202,80 @@ Respond ONLY with valid JSON (no markdown, no backticks):
 # ----------------------------------------------------------------------------
 
 def _call_groq(prompt):
-    try:
-        from groq import Groq
-        key = os.environ.get("GROQ_API_KEY", "")
-        if not key:
-            try:
-                from app.config import settings
-                key = getattr(settings, "GROQ_API_KEY", "")
-            except Exception:
-                pass
-        if not key:
-            return None
-
-        resp = Groq(api_key=key).chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system",
-                 "content": (
-                     "You write short video scripts. "
-                     "Always respond with valid JSON only. No markdown, no backticks. "
-                     f"Scripts must be EXACTLY 3 sentences and ~{SENTENCES_PER_CLIP * WORDS_PER_SENTENCE} words total."
-                 )},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.80,
-            max_tokens=500,
-        )
-        raw  = resp.choices[0].message.content.strip()
-        raw  = re.sub(r"^```json\s*", "", raw)
-        raw  = re.sub(r"```\s*$", "", raw).strip()
-        data = json.loads(raw)
-        assert data.get("topic") and data.get("script") and data.get("scenes")
-        # Enforce sentence count — truncate if AI ignored the rule
-        data["script"] = _enforce_sentences(data["script"])
-        logger.info(f"Groq script ({len(data['script'].split())}w): {data['topic']}")
-        return data
-    except Exception as e:
-        logger.warning(f"Groq: {e}")
+    """
+    Call Groq with json_object mode + word count validation.
+    Retries if script is too short (Groq sometimes ignores word count instructions).
+    """
+    key = os.environ.get("GROQ_API_KEY", "")
+    if not key:
+        try:
+            from app.config import settings
+            key = getattr(settings, "GROQ_API_KEY", "")
+        except Exception:
+            pass
+    if not key:
         return None
+
+    MIN_WORDS    = SENTENCES_PER_CLIP * 12   # floor — 36 words
+    TARGET_WORDS = SENTENCES_PER_CLIP * WORDS_PER_SENTENCE  # goal — 60 words
+
+    MODELS = [
+        "llama-3.3-70b-versatile",
+        "gemma2-9b-it",
+        "mixtral-8x7b-32768",
+    ]
+
+    system_msg = (
+        "You are a video script writer that outputs ONLY valid JSON. "
+        "No markdown. No backticks. No preamble. "
+        f"CRITICAL WORD COUNT RULE: The 'script' field MUST contain EXACTLY "
+        f"{SENTENCES_PER_CLIP} sentences. EACH sentence MUST be 18-22 words. "
+        f"Total word count MUST be {TARGET_WORDS - 5} to {TARGET_WORDS + 5} words. "
+        "Count every word carefully. A script under 35 words is WRONG."
+    )
+
+    from groq import Groq
+    client = Groq(api_key=key)
+
+    for model in MODELS:
+        for attempt in range(2):
+            try:
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user",   "content": prompt},
+                    ],
+                    temperature=0.72,
+                    max_tokens=700,
+                    response_format={"type": "json_object"},
+                )
+                raw  = resp.choices[0].message.content.strip()
+                data = json.loads(raw)
+                assert data.get("topic") and data.get("script") and data.get("scenes")
+
+                word_count = len(data["script"].split())
+                if word_count < MIN_WORDS:
+                    logger.warning(
+                        f"Groq [{model}] attempt {attempt+1}: only {word_count}w "
+                        f"(need {MIN_WORDS}+) — retrying"
+                    )
+                    continue
+
+                data["script"] = _enforce_sentences(data["script"])
+                logger.info(
+                    f"Groq [{model}] ({len(data['script'].split())}w): {data['topic']}"
+                )
+                return data
+
+            except json.JSONDecodeError as e:
+                logger.warning(f"Groq [{model}] bad JSON: {e}")
+                break
+            except Exception as e:
+                logger.warning(f"Groq [{model}]: {e}")
+                break
+
+    return None
 
 
 def _call_openai(prompt):

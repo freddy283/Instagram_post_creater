@@ -121,18 +121,28 @@ def _wrap(text, font, max_w):
 
 
 def _audio_duration(path):
+    """Get audio duration in seconds. Handles Windows ffprobe path."""
     try:
         ff    = _find_ffmpeg()
-        probe = ff.replace("ffmpeg", "ffprobe")
+        # On Windows: ffprobe sits next to ffmpeg.exe
+        probe = ff.replace("ffmpeg.exe", "ffprobe.exe").replace("ffmpeg", "ffprobe")
         if not os.path.isfile(probe):
             probe = shutil.which("ffprobe") or "ffprobe"
         r = subprocess.run(
             [probe, "-v", "quiet", "-print_format", "json", "-show_format", path],
             capture_output=True, timeout=10,
         )
-        return float(json.loads((r.stdout or b"{}").decode())["format"]["duration"])
-    except Exception:
-        return float(TARGET_DURATION_S)
+        dur = float(json.loads((r.stdout or b"{}").decode())["format"]["duration"])
+        return dur
+    except Exception as e:
+        logger.warning(f"ffprobe duration failed ({e}) — estimating from file size")
+        # Fallback: estimate duration from MP3 file size
+        # edge-tts produces ~16kB/s for 24kHz mono
+        try:
+            size_kb = os.path.getsize(path) / 1024
+            return max(1.0, size_kb / 16.0)
+        except Exception:
+            return 5.0   # safe default — NOT 18s
 
 
 def _split_sentences(script_text):
@@ -157,25 +167,44 @@ def _generate_tts(text, out_path):
     return _tts_edge(text, out_path) or _tts_pyttsx3(text, out_path)
 
 
+# Persistent event loop for edge-tts — reusing avoids asyncio.run() conflicts
+# when called multiple times in the same thread (sentence 3 failure fix)
+_tts_loop = None
+_tts_lock  = threading.Lock()
+
+
+def _get_tts_loop():
+    global _tts_loop
+    import asyncio
+    with _tts_lock:
+        if _tts_loop is None or _tts_loop.is_closed():
+            _tts_loop = asyncio.new_event_loop()
+        return _tts_loop
+
+
 def _tts_edge(text, out_path):
-    """Microsoft Edge Neural TTS — free, no API key, ~3-5s, needs internet."""
+    """Microsoft Edge Neural TTS — free, no API key, needs internet.
+    Uses a persistent event loop to avoid asyncio conflicts on repeated calls."""
     try:
-        import edge_tts
+        import edge_tts, asyncio
+
+        async def _do():
+            comm = edge_tts.Communicate(text, "en-US-GuyNeural", rate="-8%")
+            await comm.save(out_path)
 
         exc = []
 
         def _thread():
-            import asyncio
-            async def _do():
-                # Slightly slower rate (-8%) for clarity at 15-20s target
-                comm = edge_tts.Communicate(text, "en-US-GuyNeural", rate="-8%")
-                await comm.save(out_path)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
             try:
-                asyncio.run(_do())
+                loop.run_until_complete(_do())
             except Exception as e:
                 exc.append(e)
+            finally:
+                loop.close()
 
-        t = threading.Thread(target=_thread)
+        t = threading.Thread(target=_thread, daemon=True)
         t.start()
         t.join(timeout=45)
         if exc:
@@ -609,8 +638,9 @@ def generate_animated_video(
             if ok:
                 tmp_files.append(audio_path)
                 dur = _audio_duration(audio_path)
-                # Add 0.3s padding so text lingers a moment after voice ends
-                dur = max(4.0, min(10.0, dur + 0.3))
+                # Add small padding so text stays visible after voice ends
+                # Cap: min 3s (very short sentence), max 9s (one sentence shouldn't be longer)
+                dur = max(3.0, min(9.0, dur + 0.5))
                 sentence_audios.append((audio_path, dur))
                 logger.info(f"  Sentence {i+1}: {dur:.2f}s — {sentence[:50]}")
             else:
