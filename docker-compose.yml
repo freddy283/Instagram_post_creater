@@ -1,0 +1,89 @@
+version: '3.9'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: aureus_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: aureus_backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - media_videos:/app/videos
+      - media_images:/app/images
+    env_file:
+      - ./backend/.env
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: aureus_worker
+    command: celery -A app.tasks.celery_app:celery_app worker --loglevel=info --concurrency=2
+    volumes:
+      - ./backend:/app
+      - media_videos:/app/videos
+      - media_images:/app/images
+    env_file:
+      - ./backend/.env
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    restart: unless-stopped
+
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: aureus_beat
+    command: celery -A app.tasks.celery_app:celery_app beat --loglevel=info --scheduler celery.beat:PersistentScheduler
+    volumes:
+      - ./backend:/app
+      - celerybeat_data:/app/celerybeat
+    env_file:
+      - ./backend/.env
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: aureus_frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  media_videos:
+  media_images:
+  celerybeat_data:
