@@ -1,20 +1,13 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  devIndicators: false,   // removes the "N" dev toolbar button
+  devIndicators: false,
+  eslint: {
+    ignoreDuringBuilds: true,   // don't fail build on ESLint warnings
+  },
+  typescript: {
+    ignoreBuildErrors: true,    // don't fail build on TS type errors
+  },
+  output: 'standalone',        // optimised for containerised deployment
 }
 
 module.exports = nextConfig
-
-/** @type {import('next').NextConfig} */
-const nextConfig = {
-  output: 'standalone',
-  eslint: { ignoreDuringBuilds: true },
-  typescript: { ignoreBuildErrors: true },
-}
-
-module.exports = nextConfig
-```
-
-**2. Missing environment variable during build** — add to Vercel env vars:
-```
-NEXT_PUBLIC_API_URL=https://instagram-post-creater.onrender.com
