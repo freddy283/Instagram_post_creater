@@ -8,22 +8,31 @@ python-jose[cryptography]==3.3.0
 cryptography==42.0.7
 python-multipart==0.0.9
 httpx==0.27.0
-Pillow==10.4.0
+Pillow==10.3.0
+celery==5.3.6
+redis==5.0.4
+celery[redis]==5.3.6
 pydantic[email]==2.7.1
 pydantic-settings==2.2.1
 python-dotenv==1.0.1
 slowapi==0.1.9
 aiofiles==23.2.1
+boto3==1.34.101
 pytz==2024.1
 apscheduler==3.10.4
+numpy==1.26.4
 bcrypt==4.1.3
 requests==2.31.0
 
-# TTS
-edge-tts>=6.1.9
+# ── FREE TTS (no API key needed) ──────────────────────────────────────────────
+edge-tts>=6.1.9        # Microsoft Neural voices — best quality, free, needs internet
+pyttsx3>=2.90          # Offline TTS fallback — no internet needed
 
-# Script generation
-groq>=0.9.0
+# ── FREE Script generation (no credit card) ───────────────────────────────────
+groq>=0.9.0            # Groq LLaMA-3.3-70b — free at console.groq.com
+openai>=1.35.0         # Optional, only if you have an OpenAI key
 
-# Optional
-openai>=1.35.0
+# ── Paid AI Video (only install if you have credits) ─────────────────────────
+# pip install runwayml
+# pip install lumaai
+# pip install fal-client
