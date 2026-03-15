@@ -1,63 +1,199 @@
-"""Instagram Graph API — Reels posting with container polling."""
-import asyncio, httpx, logging
-from typing import Optional
+from datetime import datetime, timedelta
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import RedirectResponse
+from sqlalchemy.orm import Session
+import httpx
 
-logger = logging.getLogger(__name__)
-IG_API = "https://graph.facebook.com/v18.0"
+from app.database import get_db
+from app.models import User, InstagramConnection
+from app.schemas import InstagramConnectionOut, MessageOut
+from app.auth import get_current_user, encrypt_token, decrypt_token
+from app.config import settings
 
+router = APIRouter(prefix="/api/instagram", tags=["instagram"])
 
-async def _create_container(client, ig_account_id, access_token, **params) -> Optional[str]:
-    r = await client.post(f"{IG_API}/{ig_account_id}/media",
-                          data={"access_token": access_token, **params})
-    if r.status_code != 200:
-        logger.error(f"Container create failed: {r.json()}")
-        return None
-    return r.json().get("id")
-
-
-async def _wait_ready(client, container_id, access_token, max_wait=120) -> bool:
-    import time
-    t0 = time.time()
-    while time.time() - t0 < max_wait:
-        r = await client.get(f"{IG_API}/{container_id}",
-                             params={"fields": "status_code", "access_token": access_token})
-        if r.status_code == 200:
-            sc = r.json().get("status_code", "")
-            if sc == "FINISHED": return True
-            if sc == "ERROR": return False
-        await asyncio.sleep(5)
-    return False
+FB_AUTH_URL = "https://www.facebook.com/v18.0/dialog/oauth"
+FB_TOKEN_URL = "https://graph.facebook.com/v18.0/oauth/access_token"
+IG_SCOPES = "instagram_basic,instagram_content_publish,pages_read_engagement,pages_show_list"
 
 
-async def _publish(client, ig_account_id, container_id, access_token) -> Optional[str]:
-    r = await client.post(f"{IG_API}/{ig_account_id}/media_publish",
-                          data={"creation_id": container_id, "access_token": access_token})
-    if r.status_code != 200:
-        logger.error(f"Publish failed: {r.json()}")
-        return None
-    return r.json().get("id")
+@router.get("/connect")
+def connect_instagram(current_user: User = Depends(get_current_user)):
+    """Returns the OAuth URL to initiate Instagram connection."""
+    if not settings.INSTAGRAM_APP_ID:
+        raise HTTPException(status_code=503, detail="Instagram integration not configured")
+
+    # Encode user_id as state for CSRF protection
+    import hashlib, hmac
+    state = hmac.new(
+        settings.SECRET_KEY.encode(),
+        current_user.id.encode(),
+        hashlib.sha256,
+    ).hexdigest() + "." + current_user.id
+
+    url = (
+        f"{FB_AUTH_URL}"
+        f"?client_id={settings.INSTAGRAM_APP_ID}"
+        f"&redirect_uri={settings.INSTAGRAM_REDIRECT_URI}"
+        f"&scope={IG_SCOPES}"
+        f"&response_type=code"
+        f"&state={state}"
+    )
+    return {"oauth_url": url}
 
 
-async def post_to_instagram(ig_account_id: str, access_token: str, image_url: str, caption: str) -> dict:
-    async with httpx.AsyncClient(timeout=60) as client:
-        cid = await _create_container(client, ig_account_id, access_token, image_url=image_url, caption=caption)
-        if not cid: return {"success": False, "post_id": None, "error": "Container creation failed"}
-        pid = await _publish(client, ig_account_id, cid, access_token)
-        return {"success": bool(pid), "post_id": pid, "error": None if pid else "Publish failed"}
+
+@router.get("/auth-url")
+def auth_url(current_user: User = Depends(get_current_user)):
+    """Alias for /connect — returns OAuth URL. Called by frontend Connect button."""
+    return connect_instagram(current_user)
+
+@router.get("/callback")
+async def instagram_callback(
+    code: str = Query(...),
+    state: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """Handle Facebook/Instagram OAuth callback."""
+    # Verify state
+    import hashlib, hmac as _hmac
+    parts = state.split(".")
+    if len(parts) != 2:
+        raise HTTPException(status_code=400, detail="Invalid state")
+    received_sig, user_id = parts[0], parts[1]
+    expected = _hmac.new(
+        settings.SECRET_KEY.encode(), user_id.encode(), hashlib.sha256
+    ).hexdigest()
+    if not _hmac.compare_digest(received_sig, expected):
+        raise HTTPException(status_code=400, detail="State mismatch")
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    async with httpx.AsyncClient() as client:
+        # Exchange code for token
+        token_resp = await client.post(FB_TOKEN_URL, data={
+            "client_id": settings.INSTAGRAM_APP_ID,
+            "client_secret": settings.INSTAGRAM_APP_SECRET,
+            "redirect_uri": settings.INSTAGRAM_REDIRECT_URI,
+            "code": code,
+        })
+        if token_resp.status_code != 200:
+            raise HTTPException(status_code=400, detail="Token exchange failed")
+        token_data = token_resp.json()
+        access_token = token_data.get("access_token")
+
+        # Get long-lived token
+        ll_resp = await client.get(
+            "https://graph.facebook.com/v18.0/oauth/access_token",
+            params={
+                "grant_type": "fb_exchange_token",
+                "client_id": settings.INSTAGRAM_APP_ID,
+                "client_secret": settings.INSTAGRAM_APP_SECRET,
+                "fb_exchange_token": access_token,
+            },
+        )
+        if ll_resp.status_code == 200:
+            ll_data = ll_resp.json()
+            access_token = ll_data.get("access_token", access_token)
+            expires_in = ll_data.get("expires_in", 5184000)  # ~60 days
+        else:
+            expires_in = 3600
+
+        # Get FB pages to find connected IG account
+        pages_resp = await client.get(
+            "https://graph.facebook.com/v18.0/me/accounts",
+            params={"access_token": access_token, "fields": "id,name,instagram_business_account"},
+        )
+        ig_account_id = None
+        ig_username = None
+
+        if pages_resp.status_code == 200:
+            pages = pages_resp.json().get("data", [])
+            for page in pages:
+                ig_biz = page.get("instagram_business_account", {})
+                if ig_biz.get("id"):
+                    ig_account_id = ig_biz["id"]
+                    # Get username
+                    ig_resp = await client.get(
+                        f"https://graph.facebook.com/v18.0/{ig_account_id}",
+                        params={"fields": "username", "access_token": access_token},
+                    )
+                    if ig_resp.status_code == 200:
+                        ig_username = ig_resp.json().get("username")
+                    break
+
+        if not ig_account_id:
+            # Redirect to frontend with error
+            return RedirectResponse(
+                f"{settings.ALLOWED_ORIGINS.split(',')[0]}/connect/instagram?error=no_business_account"
+            )
+
+    # Save connection
+    existing = db.query(InstagramConnection).filter(
+        InstagramConnection.user_id == user.id
+    ).first()
+    encrypted = encrypt_token(access_token)
+    expiry = datetime.utcnow() + timedelta(seconds=expires_in)
+
+    if existing:
+        existing.ig_account_id = ig_account_id
+        existing.ig_username = ig_username
+        existing.access_token_encrypted = encrypted
+        existing.token_expiry = expiry
+        existing.is_active = True
+        existing.last_refresh_at = datetime.utcnow()
+    else:
+        db.add(InstagramConnection(
+            user_id=user.id,
+            ig_account_id=ig_account_id,
+            ig_username=ig_username,
+            access_token_encrypted=encrypted,
+            token_expiry=expiry,
+            scopes=IG_SCOPES.split(","),
+            is_active=True,
+        ))
+    db.commit()
+
+    return RedirectResponse(
+        f"{settings.ALLOWED_ORIGINS.split(',')[0]}/dashboard?ig_connected=1"
+    )
 
 
-async def post_reel_to_instagram(ig_account_id: str, access_token: str, video_url: str, caption: str) -> dict:
-    async with httpx.AsyncClient(timeout=180) as client:
-        logger.info(f"Creating Reel container for {ig_account_id}")
-        cid = await _create_container(client, ig_account_id, access_token,
-                                      media_type="REELS", video_url=video_url,
-                                      caption=caption, share_to_feed="true")
-        if not cid: return {"success": False, "post_id": None, "error": "Container creation failed"}
+@router.get("/status", response_model=dict)
+def connection_status(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    conn = db.query(InstagramConnection).filter(
+        InstagramConnection.user_id == current_user.id
+    ).first()
+    if not conn:
+        return {"status": "not_connected", "connection": None}
+    if not conn.is_active:
+        return {"status": "disconnected", "connection": None}
+    if conn.token_expiry and conn.token_expiry < datetime.utcnow():
+        conn.is_active = False
+        db.commit()
+        return {"status": "expired", "connection": None}
+    return {
+        "status": "connected",
+        "connection": InstagramConnectionOut.model_validate(conn),
+    }
 
-        logger.info(f"Waiting for container {cid}…")
-        if not await _wait_ready(client, cid, access_token):
-            return {"success": False, "post_id": None, "error": "Container timed out"}
 
-        pid = await _publish(client, ig_account_id, cid, access_token)
-        if pid: logger.info(f"Reel published: {pid}")
-        return {"success": bool(pid), "post_id": pid, "error": None if pid else "Publish failed"}
+@router.delete("/disconnect")
+@router.post("/disconnect", response_model=MessageOut)
+def disconnect(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    conn = db.query(InstagramConnection).filter(
+        InstagramConnection.user_id == current_user.id
+    ).first()
+    if conn:
+        conn.is_active = False
+        conn.access_token_encrypted = ""  # wipe token
+        db.commit()
+    return {"message": "Instagram disconnected"}

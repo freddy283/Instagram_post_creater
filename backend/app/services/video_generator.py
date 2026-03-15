@@ -361,18 +361,16 @@ def _render_frame(
     frame = Image.alpha_composite(frame.convert("RGBA"), overlay).convert("RGB")
     draw  = ImageDraw.Draw(frame)
 
-    # ── Brand / watermark ──────────────────────────────────────────────────────
-    wm_f = _font(50, bold=True)
-    wm   = watermark.upper()
-    bb   = draw.textbbox((0, 0), wm, font=wm_f)
-    wx   = (W - (bb[2] - bb[0])) // 2
-    draw.text((wx + 2, 58), wm, font=wm_f, fill=(0, 0, 0, 170))
-    draw.text((wx,     56), wm, font=wm_f, fill=(*GOLD, 230))
-
-    # ── Gold decorative line under brand ──────────────────────────────────────
-    mx = 80
-    draw.line([(mx, 128), (W // 2 - 40, 128)], fill=(*GOLD_DIM, 100), width=1)
-    draw.line([(W // 2 + 40, 128), (W - mx, 128)], fill=(*GOLD_DIM, 100), width=1)
+    # ── Brand watermark — disabled (remove comment to re-enable) ─────────────
+    # wm_f = _font(50, bold=True)
+    # wm   = watermark.upper()
+    # bb   = draw.textbbox((0, 0), wm, font=wm_f)
+    # wx   = (W - (bb[2] - bb[0])) // 2
+    # draw.text((wx + 2, 58), wm, font=wm_f, fill=(0, 0, 0, 170))
+    # draw.text((wx,     56), wm, font=wm_f, fill=(*GOLD, 230))
+    # mx = 80
+    # draw.line([(mx, 128), (W // 2 - 40, 128)], fill=(*GOLD_DIM, 100), width=1)
+    # draw.line([(W // 2 + 40, 128), (W - mx, 128)], fill=(*GOLD_DIM, 100), width=1)
 
     # ── Progress dots ──────────────────────────────────────────────────────────
     DOT  = 9
@@ -525,30 +523,65 @@ def _draw_quote_small(draw, quote, author):
 # FFMPEG HELPERS — fast, stream-based (no per-frame processing)
 # =============================================================================
 
-def _image_to_clip(img_path, duration, out_path, ff):
+def _image_to_clip(img_path, duration, out_path, ff, scene_num=0):
     """
-    Convert a single PNG → fixed-duration MP4 clip.
-    Fast: ffmpeg just loops the image, no per-frame computation.
+    Convert a PNG → MP4 clip with slow Ken Burns zoom for cinematic feel.
+    Each scene gets a different zoom/pan direction so videos look varied.
     """
-    fade_d = min(0.4, duration * 0.15)
+    fade_d = min(0.5, duration * 0.12)
+    frames = int(duration * FPS)
+
+    # Four Ken Burns styles — one per scene, cycling
+    KB_STYLES = [
+        # Slow zoom in, centre
+        f"scale=iw*1.12:ih*1.12,zoompan=z='min(zoom+0.0005,1.10)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={W}x{H}:fps={FPS}",
+        # Slow pan right + slight zoom
+        f"scale=iw*1.12:ih*1.12,zoompan=z='1.08':x='iw*0.04*on/{frames}':y='ih/2-(ih/zoom/2)':d={frames}:s={W}x{H}:fps={FPS}",
+        # Zoom out from 1.10 → 1.0
+        f"scale=iw*1.12:ih*1.12,zoompan=z='if(eq(on,1),1.10,max(zoom-0.0005,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={W}x{H}:fps={FPS}",
+        # Slow pan left
+        f"scale=iw*1.12:ih*1.12,zoompan=z='1.08':x='iw*0.04*(1-on/{frames})':y='ih/2-(ih/zoom/2)':d={frames}:s={W}x{H}:fps={FPS}",
+    ]
+
+    kb = KB_STYLES[scene_num % len(KB_STYLES)]
+
     cmd = [
         ff, "-y",
         "-loop", "1", "-i", img_path,
         "-vf", (
-            f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
-            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black,"
+            f"scale={W*2}:{H*2}:force_original_aspect_ratio=increase,"  # oversample for smooth zoom
+            f"crop={W*2}:{H*2},"
+            f"{kb},"
             f"fade=t=in:st=0:d={fade_d},"
             f"fade=t=out:st={duration - fade_d}:d={fade_d}"
         ),
         "-t", str(duration),
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "22",
         "-pix_fmt", "yuv420p",
         "-r", str(FPS),
         out_path,
     ]
-    rc, err = _run(cmd, timeout=60)
+    rc, err = _run(cmd, timeout=90)
     if rc != 0:
-        raise RuntimeError(f"image_to_clip failed: {err[-200:]}")
+        # Fallback: simple scale without zoompan (zoompan can fail on some ffmpeg builds)
+        logger.warning(f"Ken Burns failed, using simple scale: {err[-100:]}")
+        cmd2 = [
+            ff, "-y",
+            "-loop", "1", "-i", img_path,
+            "-vf", (
+                f"scale={W}:{H}:force_original_aspect_ratio=increase,"
+                f"crop={W}:{H},"
+                f"fade=t=in:st=0:d={fade_d},"
+                f"fade=t=out:st={duration - fade_d}:d={fade_d}"
+            ),
+            "-t", str(duration),
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+            "-pix_fmt", "yuv420p", "-r", str(FPS),
+            out_path,
+        ]
+        rc2, err2 = _run(cmd2, timeout=60)
+        if rc2 != 0:
+            raise RuntimeError(f"image_to_clip failed: {err2[-200:]}")
 
 
 def _concat_with_xfade(clip_paths, out_path, ff):
@@ -731,7 +764,7 @@ def generate_animated_video(
             # 3a: image → silent video clip (exact duration)
             silent_clip = tempfile.mktemp(suffix=f"_silent{i}.mp4")
             tmp_files.append(silent_clip)
-            _image_to_clip(frame, scene_dur, silent_clip, ff)
+            _image_to_clip(frame, scene_dur, silent_clip, ff, scene_num=i)
 
             # 3b: mix sentence audio into this clip
             synced_clip = tempfile.mktemp(suffix=f"_synced{i}.mp4")

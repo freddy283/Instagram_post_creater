@@ -556,14 +556,15 @@ def generate_ai_video(
 ) -> Optional[str]:
     """
     Try AI video providers in priority order.
-    Returns output_path on success, None to fall through to local PIL renderer.
+    Returns output_path on success, None to fall through to local Pixabay renderer.
 
-    Priority:
-      1. D-ID        (best quality talking head — free trial)
-      2. HeyGen      (best quality talking head — 1 free video)
-      3. Kling       (cinematic clips — 66 free credits/day)
-      4. Replicate   (Wan 2.1 → CogVideoX — free limited runs)
-      5. HuggingFace (ModelScope 1.7B — always free, no key needed)
+    D-ID and HeyGen are disabled — they produce avatar-on-green-screen videos
+    which look worse than real Pixabay photos for social content.
+
+    Active chain:
+      1. Kling  (cinematic clips — 66 free credits/day at klingai.com/dev)
+      2. Replicate (Wan 2.1 / CogVideoX — free limited runs at replicate.com)
+      3. None → falls through to local PIL + Pixabay photos (always works)
     """
     output_dir = os.path.dirname(os.path.abspath(output_path))
     script     = script_data.get("script", "")
@@ -582,23 +583,7 @@ def generate_ai_video(
         logger.info(f"✓ {provider} (silent) → {output_path}")
         return output_path
 
-    # ── 1. D-ID ───────────────────────────────────────────────────────────────
-    if _get_key("DID_API_KEY"):
-        tmp = output_path.replace(".mp4", "_did.mp4")
-        result = generate_with_did(script, tmp)
-        if result:
-            shutil.copy(result, output_path)   # D-ID includes voice
-            return output_path
-
-    # ── 2. HeyGen ─────────────────────────────────────────────────────────────
-    if _get_key("HEYGEN_API_KEY"):
-        tmp = output_path.replace(".mp4", "_hg.mp4")
-        result = generate_with_heygen(script, tmp)
-        if result:
-            shutil.copy(result, output_path)   # HeyGen includes voice
-            return output_path
-
-    # ── 3. Kling ──────────────────────────────────────────────────────────────
+    # ── Kling (cinematic clips — 66 free credits/day) ─────────────────────────
     if _get_key("KLING_API_KEY") and scenes:
         tmp = output_path.replace(".mp4", "_kling.mp4")
         result = generate_with_kling(scenes, tmp, ffmpeg_bin)
@@ -606,7 +591,7 @@ def generate_ai_video(
         if out:
             return out
 
-    # ── 4. Replicate ──────────────────────────────────────────────────────────
+    # ── Replicate (Wan 2.1 → CogVideoX — free limited runs) ──────────────────
     if _get_key("REPLICATE_API_TOKEN") and scenes:
         tmp = output_path.replace(".mp4", "_rep.mp4")
         result = generate_with_replicate(scenes, tmp, ffmpeg_bin)
@@ -614,13 +599,5 @@ def generate_ai_video(
         if out:
             return out
 
-    # ── 5. HuggingFace (always tried — free, no key needed) ───────────────────
-    hf_prompt = scenes[0] if scenes else (script_data.get("topic") or "cinematic landscape")
-    tmp = output_path.replace(".mp4", "_hf.mp4")
-    result = generate_with_huggingface(hf_prompt, tmp)
-    out = _finalise(result, "HuggingFace")
-    if out:
-        return out
-
-    logger.info("All AI providers unavailable — PIL local renderer will be used")
+    logger.info("No AI video provider configured — using local Pixabay photo render")
     return None
