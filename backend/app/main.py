@@ -75,6 +75,6 @@ app.include_router(schedule.router)
 app.include_router(posts.router)
 app.include_router(video.router)
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {"status": "ok", "env": settings.APP_ENV, "version": "2.0.0"}

@@ -1,3 +1,23 @@
-frontend/node_modules/*
-frontend/.next/*
+# Dependencies
+frontend/node_modules/
+
+# Next.js build output
+frontend/.next/
+
+# Environment secrets
 .env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Python artifacts
+*.pyc
+__pycache__/
+
+# Large Binaries
+backend/ffmpeg.exe
+backend/ffprobe.exe
+
+# Media and Uploads
+backend/videos/

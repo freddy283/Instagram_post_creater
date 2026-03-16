@@ -1,25 +1,15 @@
 FROM python:3.11-slim
 
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -u 1000 user
+USER user
+ENV PATH="/home/user/.local/bin:$PATH"
+
 WORKDIR /app
-
-# Install system dependencies including ffmpeg for video generation
-RUN apt-get update && apt-get install -y \
-    fonts-dejavu-core \
-    fonts-liberation \
-    ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY requirements.txt .
+COPY --chown=user requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY --chown=user . .
 
-RUN mkdir -p /app/images /app/videos
-
-# Non-root user for security
-RUN useradd -m appuser && chown -R appuser:appuser /app
-USER appuser
-
-EXPOSE 8000
-
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7860"]
